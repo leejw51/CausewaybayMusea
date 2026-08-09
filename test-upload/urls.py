@@ -49,11 +49,17 @@ def main(argv: list[str]) -> int:
 
     ts = sup.tailscale_info()
     lan = sup.lan_ip()
-    remote = ts.get("dns") or ts.get("ip")
+    ts_ip, ts_dns = ts.get("ip"), ts.get("dns")
+    remote = ts_ip or ts_dns
 
-    # every column holds a real, copy-pasteable URL — no <port> placeholders
-    cols = [("remote", remote), ("lan", lan), ("local", "localhost")]
+    # Every column holds a real, copy-pasteable URL — no <port> placeholders.
+    # The numeric Tailscale address leads: MagicDNS needs the tailnet's DNS
+    # settings to be working on the client, and when it is not, the 100.x
+    # address still is. The name is kept alongside it because it is the one
+    # worth typing by hand.
+    cols = [("tailscale", ts_ip), ("magicdns", ts_dns), ("lan", lan), ("local", "localhost")]
     cols = [(head, host) for head, host in cols if host]
+    primary = "tailscale" if ts_ip else ("magicdns" if ts_dns else None)
 
     label_w = max(len(label) for _, label, _ in rows)
     col_w = [
@@ -82,15 +88,15 @@ def main(argv: list[str]) -> int:
             print(f"  {dot} {C['b']}{label}{C['r']}{state}")
             for (head, host), w in zip(cols, col_w):
                 url = f"http://{host}:{port}"
-                shown = f"{C['cyn']}{C['b']}{url}{C['r']}" if head == "remote" and up else url
-                print(f"      {C['dim']}{head:<6}{C['r']} {shown}")
+                shown = f"{C['cyn']}{C['b']}{url}{C['r']}" if head == primary and up else url
+                print(f"      {C['dim']}{head:<9}{C['r']} {shown}")
             continue
 
         cells = []
         for (head, host), w in zip(cols, col_w):
             url = f"http://{host}:{port}"
             pad = " " * (w - len(url))
-            if head == "remote" and up:
+            if head == primary and up:
                 cells.append(f"{C['cyn']}{C['b']}{url}{C['r']}{pad}")
             else:
                 cells.append(f"{url}{pad}" if up else f"{C['dim']}{url}{C['r']}{pad}")
@@ -98,14 +104,13 @@ def main(argv: list[str]) -> int:
 
     print()
     if remote:
-        src = "tailscale" if ts.get("dns") else "tailscale ip"
-        print(f"  {C['dim']}remote  {src} — open on your iPhone, same tailnet{C['r']}")
-        if ts.get("dns") and ts.get("ip"):
-            print(f"  {C['dim']}        or by ip: http://{ts['ip']}:{rows[0][2]}{C['r']}")
+        print(f"  {C['dim']}tailscale  open on your iPhone, same tailnet — works from anywhere{C['r']}")
+        if ts_ip and ts_dns:
+            print(f"  {C['dim']}           the 100.x address does not depend on MagicDNS{C['r']}")
     else:
         sup.warn("tailscale not detected — run `tailscale up`, then `make urls`")
     if lan:
-        print(f"  {C['dim']}lan     same wifi/ethernet only, not over the tailnet{C['r']}")
+        print(f"  {C['dim']}lan        same wifi/ethernet only, not over the tailnet{C['r']}")
     print()
     return 0
 

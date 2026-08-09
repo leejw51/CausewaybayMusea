@@ -55,20 +55,26 @@ per backend, which is exactly what you type on the phone:
 ```
   Aperture — open the gallery
 
-  ● Rust · axum             http://your-mac.tailnet-name.ts.net:8701
-  ● Python · http.server    http://your-mac.tailnet-name.ts.net:8702
-  ● TypeScript · node:http  http://your-mac.tailnet-name.ts.net:8703
+  ● Rust · axum
+      tailscale http://100.x.y.z:8701
+      magicdns  http://your-mac.tailnet-name.ts.net:8701
+      lan       http://192.168.x.y:8701
+      local     http://localhost:8701
+  ● Python · http.server
+      …
 
-  remote  tailscale — open these on your iPhone, same tailnet
-          or by ip: http://100.x.y.z:<port>
-  lan     http://192.168.x.y:<port>
-  local   http://localhost:<port>
+  tailscale  open on your iPhone, same tailnet — works from anywhere
+             the 100.x address does not depend on MagicDNS
+  lan        same wifi/ethernet only, not over the tailnet
 ```
 
-`●` means the backend answered its health check, `○` means it is not running.
-`make urls` reprints the same table at any time.
+On a wide terminal the same information is laid out as one column per address
+kind instead of stacked. `●` means the backend answered its health check, `○`
+means it is not running. `make urls` reprints the table at any time.
 
-Open the MagicDNS URL in Safari on a device signed into the same tailnet.
+Open either Tailscale URL in Safari on a device signed into the same tailnet.
+Prefer the numeric `100.x` one if the page does not load: MagicDNS depends on
+the tailnet's DNS settings reaching the client, and the raw address does not.
 Nothing is exposed to the public internet — Tailscale is the only path in.
 
 ## What it does
