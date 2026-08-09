@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="theme-color" content="#0b0b10" />
+<title>Aperture — Photo &amp; Video Gallery</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%23f0b429' stroke-width='3'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%23f0b429'/%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div class="grain" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="mark" viewBox="0 0 40 40" aria-hidden="true">
+      <circle cx="20" cy="20" r="16" fill="none" stroke="currentColor" stroke-width="2.5" opacity=".35"/>
+      <g class="blades">
+        <path d="M20 4 L31.3 10.5 L20 20 Z"/><path d="M31.3 10.5 L31.3 29.5 L20 20 Z"/>
+        <path d="M31.3 29.5 L20 36 L20 20 Z"/><path d="M20 36 L8.7 29.5 L20 20 Z"/>
+        <path d="M8.7 29.5 L8.7 10.5 L20 20 Z"/><path d="M8.7 10.5 L20 4 L20 20 Z"/>
+      </g>
+    </svg>
+    <div class="brandtext">
+      <h1>Aperture</h1>
+      <span class="sub">large-file upload lab</span>
+    </div>
+  </div>
+
+  <div class="topmeta">
+    <span class="badge" id="backendBadge"><i class="dot"></i><span id="backendName">connecting…</span></span>
+    <span class="stat" id="statCount">0 items</span>
+    <span class="sep">·</span>
+    <span class="stat" id="statSize">0 B</span>
+    <span class="sep">·</span>
+    <span class="stat" id="statNet" title="live transfer rate">idle</span>
+  </div>
+</header>
+
+<main>
+  <section class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Add photos or videos">
+    <div class="dz-inner">
+      <div class="dz-icon">
+        <svg viewBox="0 0 48 48" aria-hidden="true">
+          <path d="M24 32V10" /><path d="M14 20l10-10 10 10" />
+          <path d="M8 30v6a4 4 0 0 0 4 4h24a4 4 0 0 0 4-4v-6" />
+        </svg>
+      </div>
+      <p class="dz-title">Drop photos &amp; videos here</p>
+      <p class="dz-sub">or <span class="link">choose files</span> — up to <b>4&nbsp;GB</b> each, resumable</p>
+      <div class="dz-chips">
+        <span class="chip">chunked</span>
+        <span class="chip">resumable</span>
+        <span class="chip">range&nbsp;streaming</span>
+        <span class="chip">adaptive&nbsp;chunk&nbsp;size</span>
+      </div>
+    </div>
+    <input type="file" id="fileInput" multiple accept="image/*,video/*" hidden />
+  </section>
+
+  <section class="queue" id="queue" hidden>
+    <div class="queue-head">
+      <h2>Transfers</h2>
+      <div class="queue-actions">
+        <span class="qsummary" id="queueSummary"></span>
+        <button class="btn ghost" id="clearDone">Clear finished</button>
+      </div>
+    </div>
+    <ul class="queue-list" id="queueList"></ul>
+  </section>
+
+  <section class="gallery-head">
+    <h2>Library</h2>
+    <div class="filters" role="tablist">
+      <button class="filter is-active" data-filter="all" role="tab">All</button>
+      <button class="filter" data-filter="image" role="tab">Photos</button>
+      <button class="filter" data-filter="video" role="tab">Videos</button>
+    </div>
+  </section>
+
+  <section class="grid" id="grid"></section>
+
+  <div class="empty" id="empty" hidden>
+    <div class="empty-orb"></div>
+    <p>Nothing here yet.</p>
+    <span>Upload something big and watch it fly.</span>
+  </div>
+</main>
+
+<footer class="foot">
+  <span id="footNote">Serving over Tailscale · open this page on your iPhone using the MagicDNS URL printed by <code>make start</code>.</span>
+</footer>
+
+<div class="lightbox" id="lightbox" hidden>
+  <button class="lb-close" id="lbClose" aria-label="Close">&times;</button>
+  <button class="lb-nav prev" id="lbPrev" aria-label="Previous">&#8249;</button>
+  <button class="lb-nav next" id="lbNext" aria-label="Next">&#8250;</button>
+  <figure class="lb-stage" id="lbStage"></figure>
+  <figcaption class="lb-caption" id="lbCaption"></figcaption>
+</div>
+
+<div class="drag-veil" id="dragVeil" aria-hidden="true"><span>Release to upload</span></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "name": "aperture-uitest",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Playwright browser tests for the Aperture upload gallery (all three backends)",
+  "scripts": {
+    "uitest": "node uitest.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.0"
+  }
+}

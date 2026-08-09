@@ -1,0 +1,24 @@
+# uploaded media and in-flight parts
+*/data/
+
+# supervisor runtime state
+*/.run/
+.run/
+
+# build output
+myrust/target/
+mytypescript/dist/
+mytypescript/node_modules/
+node_modules/
+__pycache__/
+*.pyc
+
+# generated test media and browser artifacts
+fixtures/
+.playwright-mcp/
+*.png
+!public/*.png
+
+# lockfiles for the throwaway test harness
+package-lock.json
+mytypescript/package-lock.json
