@@ -18,9 +18,18 @@ import * as http from 'node:http';
 import * as path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 
-const MAX_BYTES = 4 * 1024 * 1024 * 1024; // 4 GB
-const CHUNK_HINT = 1024 * 1024;
+// 1 TB per file. Chunks stream straight to the .part file, so size is bounded
+// by disk, not memory. MAX_CHUNK_BYTES is the abuse guard on a single PUT —
+// far above CHUNK_HINT, the 500 KB the client actually sends.
+const MAX_BYTES = 1024 * 1024 * 1024 * 1024; // 1 TB
+const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
+const CHUNK_HINT = 500 * 1024;
 const IO_BLOCK = 256 * 1024;
+// A phone that backgrounds or drops off the VPN leaves the socket OPEN and
+// simply stops sending: no FIN, no reset. Without a cap the handler waits
+// forever holding the per-id lock, so every retry queues behind a request
+// that will never finish and only a page reload recovers it.
+const CHUNK_IDLE_TIMEOUT_MS = 20_000;
 
 const PORT = Number(process.env['PORT'] ?? 8703);
 const HOST = process.env['HOST'] ?? '0.0.0.0';
@@ -256,11 +265,11 @@ async function uploadInit(req: http.IncomingMessage, res: http.ServerResponse): 
   const id = cleanId(typeof body['id'] === 'string' ? body['id'] : undefined);
   const size = Number(body['size']);
   if (!Number.isFinite(size) || size <= 0) throw new HttpError(400, 'file is empty');
-  if (size > MAX_BYTES) throw new HttpError(400, `file exceeds the ${MAX_BYTES / 2 ** 30} GB limit`);
+  if (size > MAX_BYTES) throw new HttpError(400, `file exceeds the ${MAX_BYTES / 2 ** 40} TB limit`);
 
   const result = await withLock(id, async () => {
     const done = await readJson<Item>(metaPath(id));
-    if (done) return { id, received: done.size, chunkSize: CHUNK_HINT, done: true };
+    if (done) return { id, received: done.size, chunkSize: CHUNK_HINT, maxChunk: MAX_CHUNK_BYTES, done: true };
 
     const rawName = typeof body['name'] === 'string' ? body['name'] : '';
     const name = rawName.replace(/[/\\]/g, '').slice(0, 255).trim() || `upload-${id}`;
@@ -275,7 +284,7 @@ async function uploadInit(req: http.IncomingMessage, res: http.ServerResponse): 
     } catch {
       await fsp.writeFile(part, '');
     }
-    return { id, received: Math.min(await sizeOf(part), size), chunkSize: CHUNK_HINT };
+    return { id, received: Math.min(await sizeOf(part), size), chunkSize: CHUNK_HINT, maxChunk: MAX_CHUNK_BYTES };
   });
 
   sendJson(res, result);
@@ -298,6 +307,14 @@ async function uploadChunk(
   const offset = Number(url.searchParams.get('offset'));
   if (!Number.isInteger(offset) || offset < 0) throw new HttpError(400, 'missing ?offset=');
   const declaredLen = Number(req.headers['content-length'] ?? 0);
+
+  // Per-PUT abuse guard, before the lock and before reading a byte.
+  if (declaredLen > MAX_CHUNK_BYTES) {
+    await drain(req);
+    throw new HttpError(413, `chunk too large — send at most ${MAX_CHUNK_BYTES / 2 ** 20} MB per PUT`, {
+      received: await sizeOf(partPath(id)).catch(() => 0),
+    });
+  }
 
   const result = await withLock(id, async () => {
     const part = partPath(id);
@@ -329,10 +346,25 @@ async function uploadChunk(
     let written = offset;
     try {
       try {
-        for await (const block of req) {
-          const buf = block as Buffer;
-          await fh.write(buf, 0, buf.length, written);
-          written += buf.length;
+        // Abandon a body that has gone silent, so the lock is released and
+        // the client's retry is not queued behind a dead request.
+        let idle: NodeJS.Timeout | undefined;
+        const armIdle = () => {
+          clearTimeout(idle);
+          idle = setTimeout(() => req.destroy(new Error(
+            `no data for ${CHUNK_IDLE_TIMEOUT_MS / 1000}s`,
+          )), CHUNK_IDLE_TIMEOUT_MS);
+        };
+        armIdle();
+        try {
+          for await (const block of req) {
+            armIdle();
+            const buf = block as Buffer;
+            await fh.write(buf, 0, buf.length, written);
+            written += buf.length;
+          }
+        } finally {
+          clearTimeout(idle);
         }
       } catch (err) {
         // socket died mid-chunk: keep whatever landed, the client resumes here

@@ -28,9 +28,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-MAX_BYTES = 4 * 1024 * 1024 * 1024          # 4 GB
-CHUNK_HINT = 1024 * 1024
+# 1 TB per file. Chunks stream straight to the .part file, so size is bounded
+# by disk, not memory. MAX_CHUNK_BYTES is the abuse guard on a single PUT —
+# far above CHUNK_HINT, the 500 KB the client actually sends.
+MAX_BYTES = 1024 * 1024 * 1024 * 1024       # 1 TB
+MAX_CHUNK_BYTES = 8 * 1024 * 1024
+CHUNK_HINT = 500 * 1024
 IO_BLOCK = 256 * 1024
+CHUNK_IDLE_TIMEOUT = 20                     # s of socket silence before a chunk is abandoned
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -388,12 +393,13 @@ class Handler(BaseHTTPRequestHandler):
         if size <= 0:
             raise HttpError(400, "file is empty")
         if size > MAX_BYTES:
-            raise HttpError(400, f"file exceeds the {MAX_BYTES >> 30} GB limit")
+            raise HttpError(400, f"file exceeds the {MAX_BYTES >> 40} TB limit")
 
         with lock_for(i):
             done = read_json(meta_path(i))
             if done:
-                return self.send_json({"id": i, "received": done["size"], "chunkSize": CHUNK_HINT, "done": True})
+                return self.send_json({"id": i, "received": done["size"], "chunkSize": CHUNK_HINT,
+                                       "maxChunk": MAX_CHUNK_BYTES, "done": True})
 
             name = "".join(c for c in str(req.get("name", "")) if c not in "/\\")[:255].strip()
             name = name or f"upload-{i}"
@@ -408,7 +414,8 @@ class Handler(BaseHTTPRequestHandler):
                 part.touch()
             received = min(size_of(part), size)
 
-        self.send_json({"id": i, "received": received, "chunkSize": CHUNK_HINT})
+        self.send_json({"id": i, "received": received, "chunkSize": CHUNK_HINT,
+                        "maxChunk": MAX_CHUNK_BYTES})
 
     def upload_complete(self, raw_id: str):
         i = clean_id(raw_id)
@@ -462,6 +469,18 @@ class Handler(BaseHTTPRequestHandler):
 
         length = int(self.headers.get("Content-Length") or 0)
 
+        # Per-PUT abuse guard. Refuse before taking the lock or reading a byte,
+        # so one huge request cannot tie up an upload. Declared length is
+        # enough here — the rust backend has to check mid-stream because a
+        # chunked body has no Content-Length, but this server requires one.
+        if length > MAX_CHUNK_BYTES:
+            self.close_connection = True
+            raise HttpError(
+                413,
+                f"chunk too large — send at most {MAX_CHUNK_BYTES >> 20} MB per PUT",
+                received=size_of(part_path(i)) if part_path(i).exists() else 0,
+            )
+
         with lock_for(i):
             part = part_path(i)
             if not part.exists():
@@ -480,19 +499,41 @@ class Handler(BaseHTTPRequestHandler):
                 raise HttpError(400, "chunk would exceed the declared file size")
 
             written = offset
-            with part.open("r+b") as f:
-                f.seek(offset)
-                left = length
-                while left > 0:
-                    block = self.rfile.read(min(IO_BLOCK, left))
-                    if not block:
-                        break                       # connection died mid-chunk
-                    f.write(block)
-                    written += len(block)
-                    left -= len(block)
-                f.flush()
-                os.fsync(f.fileno())
-                f.truncate(written)
+            idle_out = False
+            prev_timeout = self.connection.gettimeout()
+            self.connection.settimeout(CHUNK_IDLE_TIMEOUT)
+            try:
+                with part.open("r+b") as f:
+                    f.seek(offset)
+                    left = length
+                    while left > 0:
+                        try:
+                            block = self.rfile.read(min(IO_BLOCK, left))
+                        except (TimeoutError, socket.timeout):
+                            # Silent socket: stop waiting so lock_for(i) frees.
+                            idle_out = True
+                            break
+                        if not block:
+                            break                   # connection died mid-chunk
+                        f.write(block)
+                        written += len(block)
+                        left -= len(block)
+                    f.flush()
+                    os.fsync(f.fileno())
+                    f.truncate(written)
+            finally:
+                try:
+                    self.connection.settimeout(prev_timeout)
+                except OSError:
+                    pass
+
+            if idle_out:
+                self.close_connection = True
+                raise HttpError(
+                    408,
+                    f"no data for {CHUNK_IDLE_TIMEOUT}s — resume from {written}",
+                    received=written,
+                )
 
             if written != offset + length:
                 self.close_connection = True

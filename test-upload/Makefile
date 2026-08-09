@@ -10,7 +10,7 @@ PY    ?= python3
 DIRS  := myrust mypython mytypescript
 
 .DEFAULT_GOAL := help
-.PHONY: help start stop restart status urls test uitest verify fixtures deps clean distclean $(DIRS)
+.PHONY: help start stop restart status urls test uitest chunktest verify fixtures deps clean distclean $(DIRS)
 
 help: ## show this help
 	@printf '\n  \033[1mAperture\033[0m \033[2m— 4 GB resumable photo & video uploads, three ways\033[0m\n\n'
@@ -43,7 +43,10 @@ test: ## protocol tests against all three (chunking, resume, ranges)
 uitest: ## browser tests against all three (Chromium, throttled + interrupted)
 	@node uitest.mjs all
 
-verify: test uitest ## run both test suites
+chunktest: ## browser test: small-chunk policy + resume-after-reload, all three
+	@for p in 8701 8702 8703; do node chunktest.mjs $$p || exit 1; done
+
+verify: test uitest chunktest ## run every test suite
 
 fixtures: ## generate test media with ffmpeg (add MB=500 for a big one)
 	@./fixtures.sh $(MB)
