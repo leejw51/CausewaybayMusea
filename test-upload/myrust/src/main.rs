@@ -15,7 +15,7 @@ use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -31,9 +31,28 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
 
-const MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GB
-const CHUNK_HINT: u64 = 1024 * 1024;
+// 1 TB per file. Chunks stream straight to the .part file, so file size is a
+// disk question, not a memory one — but each individual PUT must stay small:
+// the client sends 1–4 MB chunks, and anything over MAX_CHUNK_BYTES is
+// rejected mid-stream so a buggy or hostile client cannot tie up a connection
+// with one giant request.
+const MAX_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+// The client sends fixed 500 KB chunks (CHUNK_HINT). MAX_CHUNK_BYTES is only
+// the abuse guard — a single PUT may not tie up a connection with an enormous
+// body — so it sits far above the working size and must stay above anything a
+// legitimate client or the protocol suite sends.
+const MAX_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+const CHUNK_HINT: u64 = 500 * 1024;
 const READ_BUF: usize = 256 * 1024;
+// How long a chunk upload may sit with nothing arriving before we give up on
+// it. A phone that backgrounds, loses wifi or drops off the tailnet leaves the
+// socket OPEN and simply stops sending: no FIN, no reset, nothing to notice.
+// Without this the handler waits forever *while holding the per-id lock*, so
+// every retry for that upload queues behind a request that will never finish
+// and the transfer only recovers when the page is reloaded and the OS finally
+// tears the old socket down. Bail out instead, release the lock, and let the
+// client resume from the bytes we did commit.
+const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 // ── model ───────────────────────────────────────────────────────────
 
@@ -135,14 +154,22 @@ fn ts() -> String {
 async fn log_requests(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
+    // peer address answers which path the client took: 192.168.x = LAN,
+    // 100.x = tailscale, 127.0.0.1 = local/simulator
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip().to_string())
+        .unwrap_or_else(|| "?".into());
     if uri.path() == "/api/dlog" {
         return next.run(req).await; // phone log lines are printed by the sink itself
     }
     let t0 = Instant::now();
     let res = next.run(req).await;
     println!(
-        "{} {} {} -> {} in {}ms",
+        "{} [{}] {} {} -> {} in {}ms",
         ts(),
+        peer,
         method,
         uri,
         res.status().as_u16(),
@@ -294,7 +321,7 @@ async fn upload_init(
         return Err(bad("file is empty"));
     }
     if req.size > MAX_BYTES {
-        return Err(bad(format!("file exceeds the {} GB limit", MAX_BYTES / (1 << 30))));
+        return Err(bad(format!("file exceeds the {} TB limit", MAX_BYTES >> 40)));
     }
 
     let guard = st.lock_for(&id).await;
@@ -303,7 +330,7 @@ async fn upload_init(
     // already finished? report it as fully received so the client just completes
     if st.meta_path(&id).exists() {
         let item = read_item(&st, &id).await?;
-        return Ok(Json(json!({ "id": id, "received": item.size, "chunkSize": CHUNK_HINT, "done": true })));
+        return Ok(Json(json!({ "id": id, "received": item.size, "chunkSize": CHUNK_HINT, "maxChunk": MAX_CHUNK_BYTES, "done": true })));
     }
 
     let name: String = req.name.chars().filter(|c| *c != '/' && *c != '\\').take(255).collect();
@@ -323,7 +350,7 @@ async fn upload_init(
     }
     let received = file_len(&part).await.min(req.size);
 
-    Ok(Json(json!({ "id": id, "received": received, "chunkSize": CHUNK_HINT })))
+    Ok(Json(json!({ "id": id, "received": received, "chunkSize": CHUNK_HINT, "maxChunk": MAX_CHUNK_BYTES })))
 }
 
 async fn upload_status(
@@ -338,6 +365,12 @@ async fn upload_status(
     Ok(Json(json!({ "received": file_len(&st.part(&id)).await, "done": false })))
 }
 
+// Keep-alive is deliberately left on. An earlier revision answered every
+// chunk with `Connection: close` while hunting a Safari stall; the real
+// causes turned out to be elsewhere (a bfcache-resurrected second uploader
+// and replies lost in the tunnel), and at a 100 KB chunk size a fresh TCP
+// handshake per chunk would dominate the transfer. Sequential chunk PUTs on
+// one reused connection are covered by the protocol test.
 async fn upload_chunk(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -385,7 +418,28 @@ async fn upload_chunk(
 
     let mut written = offset;
     let mut stream = body.into_data_stream();
-    while let Some(next) = stream.next().await {
+    loop {
+        let next = match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(n)) => n,
+            Ok(None) => break, // body finished normally
+            Err(_) => {
+                // Silent socket. Commit what arrived and let go of the lock so
+                // the client's retry is not queued behind a dead request.
+                let _ = file.flush().await;
+                println!(
+                    "{} [chunk] {id} idle {}s @{written} — abandoning so the lock frees",
+                    ts(),
+                    CHUNK_IDLE_TIMEOUT.as_secs()
+                );
+                return Err(ApiError::with(
+                    StatusCode::REQUEST_TIMEOUT,
+                    json!({
+                        "error": format!("no data for {}s — resume from {written}", CHUNK_IDLE_TIMEOUT.as_secs()),
+                        "received": written
+                    }),
+                ));
+            }
+        };
         let bytes = match next {
             Ok(b) => b,
             Err(e) => {
@@ -397,6 +451,17 @@ async fn upload_chunk(
                 ));
             }
         };
+        if written - offset + bytes.len() as u64 > MAX_CHUNK_BYTES {
+            let _ = file.flush().await;
+            let _ = file.set_len(offset).await;
+            return Err(ApiError::with(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({
+                    "error": format!("chunk too large — send at most {} MB per PUT", MAX_CHUNK_BYTES >> 20),
+                    "received": offset
+                }),
+            ));
+        }
         if written + bytes.len() as u64 > declared.min(MAX_BYTES) {
             let _ = file.flush().await;
             let _ = file.set_len(written).await;
@@ -631,7 +696,7 @@ async fn main() {
     println!("aperture [{backend}] listening on http://{addr}");
     println!("storage: {}", st.root.display());
 
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown())
         .await
         .expect("server error");

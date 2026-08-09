@@ -272,9 +272,154 @@ def run(port: int, size_mb: float) -> Report:
     status, _, _ = call(base, "/media/doesnotexist", raw=True)
     rep.check(status == 404, "unknown id → 404", f"unknown id returned {status}")
 
+    # size limit comes from the backend itself, so the same test drives a
+    # 4 GB python/ts backend and the 1 TB rust backend
+    _, _, health = call(base, "/api/health")
+    max_bytes = int(health.get("maxBytes", 4 * 1024**3))
+
     status, _, _ = call(base, "/api/upload/init", "POST",
-                        json.dumps({"id": "sizetest", "name": "x.mp4", "size": 5 * 1024**3}).encode(), json_hdr)
-    rep.check(status == 400, "a file over 4 GB is refused at init", f"oversize init returned {status}")
+                        json.dumps({"id": "sizetest", "name": "x.mp4", "size": max_bytes + 1}).encode(), json_hdr)
+    rep.check(status == 400, f"a file over the {max_bytes >> 30} GB limit is refused at init",
+              f"oversize init returned {status}")
+
+    status, _, body = call(base, "/api/upload/init", "POST",
+                        json.dumps({"id": "sizetest2", "name": "big.mp4", "size": max_bytes}).encode(), json_hdr)
+    rep.check(status == 200, f"a file of exactly {max_bytes >> 30} GB is accepted at init",
+              f"max-size init returned {status}")
+    call(base, "/api/upload/sizetest2", "DELETE")
+
+    # backends that advertise a per-PUT chunk cap must enforce it mid-stream
+    if isinstance(body, dict) and body.get("maxChunk"):
+        max_chunk = int(body["maxChunk"])
+        cid = "chunkcaptest"
+        call(base, f"/api/upload/{cid}", "DELETE")
+        call(base, "/api/upload/init", "POST",
+             json.dumps({"id": cid, "name": "c.mp4", "size": max_chunk * 4}).encode(), json_hdr)
+        # raw socket: the server answers 413 and stops reading while we are
+        # still writing, so a buffered client would just see a broken pipe
+        chost, cport = base.split("//", 1)[1].split(":")
+        oversize = max_chunk + 1024
+        csock = socket.create_connection((chost, int(cport)), timeout=20)
+        cstatus = ""
+        try:
+            csock.sendall(
+                f"PUT /api/upload/{cid}?offset=0 HTTP/1.1\r\nHost: {chost}\r\n"
+                f"Content-Type: application/octet-stream\r\n"
+                f"Content-Length: {oversize}\r\n\r\n".encode()
+            )
+            blk = b"\x00" * 65536
+            sent = 0
+            while sent < oversize:
+                csock.sendall(blk[: min(len(blk), oversize - sent)])
+                sent += min(len(blk), oversize - sent)
+        except OSError:
+            pass  # expected: server rejected and stopped reading
+        try:
+            head = csock.recv(200).decode(errors="replace")
+            cstatus = head.split("\r\n", 1)[0]
+        except OSError:
+            pass
+        csock.close()
+        rep.check("413" in cstatus,
+                  f"a chunk over {max_chunk >> 10} KB is rejected with 413",
+                  f"oversize chunk returned {cstatus!r}")
+        _, _, st2 = call(base, f"/api/upload/{cid}/status")
+        rep.check(st2.get("received") == 0, "rejected oversize chunk leaves offset at 0",
+                  f"offset after oversize chunk: {st2.get('received')}")
+        call(base, f"/api/upload/{cid}", "DELETE")
+
+    # ── many small chunks over ONE keep-alive connection ──────────────
+    # A browser reuses a single connection for consecutive chunk PUTs. At a
+    # 100 KB chunk size that path carries the entire transfer, so it has to
+    # survive far more than a couple of round trips.
+    host, port = base.split("//", 1)[1].split(":")
+    kid = "keepalive-many"
+    call(base, f"/api/upload/{kid}", "DELETE")
+    n_chunks, csize = 40, 500 * 1024
+    call(base, "/api/upload/init", "POST",
+         json.dumps({"id": kid, "name": "ka.mp4", "size": n_chunks * csize}).encode(), json_hdr)
+
+    sock = socket.create_connection((host, int(port)), timeout=20)
+    reused_ok, first_failure = 0, None
+    try:
+        for n in range(n_chunks):
+            payload = bytes([n % 256]) * csize
+            sock.sendall(
+                f"PUT /api/upload/{kid}?offset={n * csize} HTTP/1.1\r\nHost: {host}\r\n"
+                f"Content-Type: application/octet-stream\r\n"
+                f"Content-Length: {csize}\r\n\r\n".encode() + payload
+            )
+            head = b""
+            while b"\r\n\r\n" not in head:
+                d = sock.recv(4096)
+                if not d:
+                    break
+                head += d
+            if not head:
+                first_failure = f"connection closed at chunk {n + 1}"
+                break
+            status_line = head.split(b"\r\n", 1)[0].decode(errors="replace")
+            if " 200 " not in status_line:
+                first_failure = f"chunk {n + 1} returned {status_line}"
+                break
+            # drain the JSON body so the next request starts clean
+            clen = 0
+            for line in head.split(b"\r\n\r\n", 1)[0].split(b"\r\n")[1:]:
+                if line.lower().startswith(b"content-length:"):
+                    clen = int(line.split(b":")[1])
+            body_seen = len(head.split(b"\r\n\r\n", 1)[1])
+            while body_seen < clen:
+                body_seen += len(sock.recv(4096))
+            reused_ok += 1
+    except OSError as e:
+        first_failure = f"{type(e).__name__} at chunk {reused_ok + 1}: {e}"
+    finally:
+        sock.close()
+
+    rep.check(reused_ok == n_chunks,
+              f"{n_chunks} consecutive {csize >> 10} KB chunks on one keep-alive connection",
+              first_failure or f"only {reused_ok}/{n_chunks} succeeded")
+    _, _, kst = call(base, f"/api/upload/{kid}/status")
+    rep.check(kst.get("received") == n_chunks * csize,
+              "keep-alive run committed every byte in order",
+              f"server has {kst.get('received')} of {n_chunks * csize}")
+    call(base, f"/api/upload/{kid}", "DELETE")
+
+    # ── a wedged chunk must not block the next one ────────────────────
+    # A phone that backgrounds or drops off the VPN leaves the socket OPEN and
+    # stops sending — no FIN, no reset. If the handler waits forever holding
+    # the per-upload lock, every retry queues behind a request that will never
+    # finish and only a page reload recovers it. That was a real bug in all
+    # three backends; this pins it shut.
+    wid = "wedgetest"
+    call(base, f"/api/upload/{wid}", "DELETE")
+    call(base, "/api/upload/init", "POST",
+         json.dumps({"id": wid, "name": "w.mp4", "size": 8 * 1024 * 1024}).encode(), json_hdr)
+
+    wedge = socket.create_connection((host, int(port)), timeout=30)
+    wedge.sendall(
+        f"PUT /api/upload/{wid}?offset=0 HTTP/1.1\r\nHost: {host}\r\n"
+        f"Content-Type: application/octet-stream\r\n"
+        f"Content-Length: {4 * 1024 * 1024}\r\n\r\n".encode()
+    )
+    wedge.sendall(b"\x00" * (512 * 1024))   # part of the promised body, then silence
+    time.sleep(1.0)
+
+    rep.note("a chunk went silent mid-body; the next chunk must not hang …")
+    t_probe = time.time()
+    pstatus, _, _ = call(base, f"/api/upload/{wid}?offset={512 * 1024}", "PUT",
+                         b"\x01" * (256 * 1024), bin_hdr, timeout=90)
+    probe_s = time.time() - t_probe
+    # it may legitimately wait out the server's idle timeout (~20s), but it
+    # must not wait forever — before the fix this never returned at all
+    rep.check(probe_s < 60,
+              f"a wedged chunk released the lock in {probe_s:.0f}s (status {pstatus})",
+              f"next chunk still blocked after {probe_s:.0f}s — the lock is wedged")
+    try:
+        wedge.close()
+    except OSError:
+        pass
+    call(base, f"/api/upload/{wid}", "DELETE")
 
     # 13 ─ listing and delete ---------------------------------------------
     status, _, lst = call(base, "/api/media")

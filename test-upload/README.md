@@ -73,7 +73,11 @@ Nothing is exposed to the public internet — Tailscale is the only path in.
 
 ## What it does
 
-- **4 GB per file**, photo or video, several queued at once.
+- **1 TB per file**, photo or video, several queued at once. Files move as
+  fixed **500 KB chunks** — no adaptation, no one-shot `FormData` post.
+  Neither side ever holds more than one chunk in memory, so file size is a
+  disk question, not a memory one. All three backends reject any single PUT
+  over 8 MB.
 - **Chunked and resumable.** The upload id is a hash of `name|size|mtime`, so
   reloading the page and re-picking the same file resumes from the server's
   byte offset instead of starting over.
@@ -124,13 +128,20 @@ meta/<id>.json     finished metadata
 ```sh
 make test        # protocol, all three backends  (python, no deps)
 make uitest      # browser, all three backends   (playwright chromium)
-make verify      # both
+make chunktest   # chunk policy + resume, all three (playwright chromium)
+make verify      # all three suites
 ```
 
 `smoketest.py` drives the raw HTTP protocol, including the failure modes that
 actually bite on a phone: a wrong offset, a chunk cut off mid-flight (raw
 socket, half a chunk then FIN), resume from the partial offset, four flavours
 of `Range`, concurrent range reads, path-traversal ids, and oversize files.
+
+`chunktest.mjs` pins the chunking policy and the resume path: that a large
+file goes up as many small chunks rather than one request, that no chunk
+exceeds 500 KB, that offsets never regress, and that a **hard page reload
+mid-transfer resumes from the server's offset** without re-sending a single
+committed byte.
 
 `uitest.mjs` drives the real UI in Chromium with the network throttled to
 ~40 Mbps and 60 ms latency. It verifies progress ticks through many distinct
@@ -173,6 +184,29 @@ Inside `myrust`, `mypython` or `mytypescript`:
 detached in its own process group, waits for `/api/health` to answer before
 declaring success (dumping the log tail if it never does), tracks the pid,
 kills strays squatting on the port, and resolves the Tailscale MagicDNS name.
+
+## Debugging a phone
+
+Phones have no console, so the page keeps its own log — open the **debug log**
+disclosure at the bottom of the gallery.
+
+For a stall that survives a page reload, turn on the relay:
+
+```
+http://your-mac.tailnet-name.ts.net:8701/?debug=1    # on, sticky across reloads
+http://your-mac.tailnet-name.ts.net:8701/?debug=0    # off
+```
+
+With it on, every client log line is mirrored into the server's log as
+`[phone] …`, and the last 60 lines are kept in `localStorage` so a page that
+dies mid-upload replays its final moments on the next load, prefixed `prev|`.
+That is what a self-reloading tab looks like from the server side, and it is
+how the stall bugs were found.
+
+It is off by default: the relay is one POST per log line, which during a large
+upload competes with the upload itself. `?debug=1&selftest=200` additionally
+pushes a synthetic 200 MB file through the real upload path without touching
+the file picker — useful in a simulator.
 
 ## Notes
 
