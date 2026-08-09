@@ -62,21 +62,47 @@ const MAX_CHUNK_EFF = MAX_CHUNK; // same small-chunk policy everywhere
 
 const $ = (id) => document.getElementById(id);
 
-/* ── on-page debug log (phones have no console) ──────── */
+/* ── on-page debug log (phones have no console) ────────
+ *
+ * The on-page panel is always live: it is local, free, and the only console a
+ * phone has. Relaying every line to the server and mirroring it through
+ * localStorage is not free — one POST and one JSON round-trip through
+ * localStorage per line, which during a large upload is thousands of extra
+ * requests on the same link the upload needs. Those two are the forensics
+ * that found the stall bugs, so they stay one URL away rather than deleted:
+ *
+ *     http://host:8701/?debug=1     ← turn on, sticky across reloads
+ *     http://host:8701/?debug=0     ← turn off
+ *
+ * Sticky matters: the pages worth investigating are the ones that reload
+ * themselves mid-upload, and a query param would not survive that.
+ */
+const DEBUG = (() => {
+  try {
+    const q = new URLSearchParams(location.search).get('debug');
+    if (q !== null) {
+      if (q === '0' || q === 'false') localStorage.removeItem('aperture.debug');
+      else localStorage.setItem('aperture.debug', '1');
+    }
+    return localStorage.getItem('aperture.debug') === '1';
+  } catch (_) { return false; }
+})();
 
 const dbuf = [];
 function dlog(msg) {
   const line = new Date().toTimeString().slice(0, 8) + ' ' + msg;
-  // mirror to the server so phone-side stalls appear in its log timeline
-  try { fetch('/api/dlog', { method: 'POST', body: line, keepalive: true }).catch(() => {}); } catch (_) {}
-  // and to localStorage: when the page dies mid-upload, the in-flight relay
-  // lines are lost — the next incarnation replays these so the server log
-  // shows the previous page's final moments (see replayPrevLog)
-  try {
-    const ring = JSON.parse(localStorage.getItem('dlogRing') || '[]');
-    ring.push(line);
-    localStorage.setItem('dlogRing', JSON.stringify(ring.slice(-60)));
-  } catch (_) {}
+  if (DEBUG) {
+    // mirror to the server so phone-side stalls appear in its log timeline
+    try { fetch('/api/dlog', { method: 'POST', body: line, keepalive: true }).catch(() => {}); } catch (_) {}
+    // and to localStorage: when the page dies mid-upload the in-flight relay
+    // lines are lost, so the next incarnation replays these and the server
+    // log shows the previous page's final moments (see replayPrevLog)
+    try {
+      const ring = JSON.parse(localStorage.getItem('dlogRing') || '[]');
+      ring.push(line);
+      localStorage.setItem('dlogRing', JSON.stringify(ring.slice(-60)));
+    } catch (_) {}
+  }
   dbuf.push(line);
   if (dbuf.length > 300) dbuf.shift();
   const pre = document.getElementById('dbgLog');
@@ -87,6 +113,7 @@ function dlog(msg) {
 }
 
 function replayPrevLog() {
+  if (!DEBUG) return;
   try {
     const ring = JSON.parse(localStorage.getItem('dlogRing') || '[]');
     localStorage.removeItem('dlogRing');
@@ -1255,10 +1282,12 @@ window.addEventListener('beforeunload', (e) => {
   }
   await restoreQueue();
 
-  // ?selftest=44 → upload a synthetic 44 MB file through the real pipeline.
-  // Exists so an iOS Simulator (or any browser) can exercise the full XHR
-  // upload path without touching the file picker.
-  const selftestMB = Number(new URLSearchParams(location.search).get('selftest') || 0);
+  // ?debug=1&selftest=44 → upload a synthetic 44 MB file through the real
+  // pipeline. Exists so an iOS Simulator (or any browser) can exercise the
+  // full XHR upload path without touching the file picker. Gated behind
+  // DEBUG: it allocates the file in memory, so it is not something a stray
+  // link should be able to trigger.
+  const selftestMB = DEBUG ? Number(new URLSearchParams(location.search).get('selftest') || 0) : 0;
   if (selftestMB > 0 && !state.queue.length) {
     const mb = Math.min(selftestMB, 500);
     dlog(`selftest: building a ${mb} MB synthetic file`);

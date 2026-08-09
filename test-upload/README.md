@@ -163,6 +163,29 @@ detached in its own process group, waits for `/api/health` to answer before
 declaring success (dumping the log tail if it never does), tracks the pid,
 kills strays squatting on the port, and resolves the Tailscale MagicDNS name.
 
+## Debugging a phone
+
+Phones have no console, so the page keeps its own log — open the **debug log**
+disclosure at the bottom of the gallery.
+
+For a stall that survives a page reload, turn on the relay:
+
+```
+http://your-mac.tailnet-name.ts.net:8701/?debug=1    # on, sticky across reloads
+http://your-mac.tailnet-name.ts.net:8701/?debug=0    # off
+```
+
+With it on, every client log line is mirrored into the server's log as
+`[phone] …`, and the last 60 lines are kept in `localStorage` so a page that
+dies mid-upload replays its final moments on the next load, prefixed `prev|`.
+That is what a self-reloading tab looks like from the server side, and it is
+how the stall bugs were found.
+
+It is off by default: the relay is one POST per log line, which during a large
+upload competes with the upload itself. `?debug=1&selftest=200` additionally
+pushes a synthetic 200 MB file through the real upload path without touching
+the file picker — useful in a simulator.
+
 ## Notes
 
 - Uploads are stored unmodified on disk; there is no auth. This is a test rig
