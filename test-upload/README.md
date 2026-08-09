@@ -12,6 +12,28 @@ backends so you can compare them on identical client code.
 
 All three bind `0.0.0.0` so they are reachable over the tailnet.
 
+> [!WARNING]
+> **There is no authentication. Do not expose this to the internet.**
+>
+> Anyone who can reach the port can upload files, list and download every
+> item, and delete them. Uploads are written to disk unmodified, and there is
+> no rate limit or size quota beyond the 4 GB per-file cap.
+>
+> All three backends bind `0.0.0.0`, meaning *every* interface the host has —
+> not just the tailnet. Tailscale is the intended and only sanctioned path in;
+> it is what keeps this off the public internet. If the machine also has a
+> routable address or sits behind a forwarded port, `make start` will serve
+> the gallery there too.
+>
+> To bind narrowly instead, set `HOST` — it is honoured by `make start`:
+>
+> ```sh
+> HOST=127.0.0.1 make start     # loopback only
+> HOST=100.x.y.z make start     # your Tailscale IP only
+> ```
+>
+> This is a test rig for a private tailnet, not a service to deploy.
+
 ## Quick start
 
 ```sh

@@ -40,7 +40,8 @@ ROOT = Path(__file__).resolve().parent
 RUN = ROOT / ".run"
 PIDFILE = RUN / "server.pid"
 LOGFILE = RUN / "server.log"
-HOST = "0.0.0.0"
+# bind address; override with HOST=127.0.0.1 or HOST=<tailscale-ip> to narrow it
+HOST = os.environ.get("HOST", "0.0.0.0")
 
 C = {
     "r": "\033[0m", "b": "\033[1m", "dim": "\033[2m",
@@ -172,6 +173,15 @@ def print_urls(port: int) -> None:
     lan = lan_ip()
     say()
     say(f"  {C['b']}Open the gallery{C['r']}")
+    # a narrowed HOST means the LAN/tailscale addresses below do not answer
+    if HOST not in ("0.0.0.0", "::", ""):
+        say(f"    {C['dim']}bound to {HOST} only{C['r']}")
+        if HOST in ("127.0.0.1", "localhost", "::1"):
+            say(f"    {C['dim']}local     {C['r']}http://localhost:{port}")
+        else:
+            say(f"    {C['dim']}direct    {C['r']}http://{HOST}:{port}")
+        say()
+        return
     say(f"    {C['dim']}local     {C['r']}http://localhost:{port}")
     if lan:
         say(f"    {C['dim']}lan       {C['r']}http://{lan}:{port}")
